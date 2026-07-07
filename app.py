@@ -93,24 +93,31 @@ def create_volterra_dataset(data_in, data_out, mem_depth):
 def analyze_im3_and_memory():
     N_tt = 8192
     t = np.arange(N_tt)
+    window = np.blackman(N_tt)
     
     # 1. Power Sweep (AM-AM & IM3 Asymptotes)
-    pin_db = np.linspace(-30, 5, 25)
+    pin_db = np.linspace(-20, 5, 20)
     pout_fund, pout_im3 = [], []
-    f1, f2 = 0.04, 0.05
+    
+    # Snap frequencies exactly to FFT bins to completely eliminate spectral leakage
+    k1, k2 = int(0.04 * N_tt), int(0.05 * N_tt)
+    f1, f2 = k1 / N_tt, k2 / N_tt
     
     for p in pin_db:
         amp = 10**(p/20.0)
         x = amp * (np.exp(1j * 2 * np.pi * f1 * t) + np.exp(1j * 2 * np.pi * f2 * t))
         y = simulate_pa(x, SPS)
-        Y_f = np.fft.fft(y) / N_tt
+        
+        # Apply window to suppress start-of-burst transient leakage
+        Y_f = np.fft.fft(y * window) / np.sum(window)
         freqs = np.fft.fftfreq(N_tt)
         
         idx_f1, idx_f2 = np.argmin(np.abs(freqs - f1)), np.argmin(np.abs(freqs - f2))
         idx_im3_l, idx_im3_u = np.argmin(np.abs(freqs - (2*f1 - f2))), np.argmin(np.abs(freqs - (2*f2 - f1)))
         
-        p_fund = 10*np.log10((np.abs(Y_f[idx_f1])**2 + np.abs(Y_f[idx_f2])**2)/2 + 1e-12)
-        p_im3 = 10*np.log10((np.abs(Y_f[idx_im3_l])**2 + np.abs(Y_f[idx_im3_u])**2)/2 + 1e-12)
+        # Lower noise floor to -200 dB (1e-20) to reveal true 3:1 small-signal slope
+        p_fund = 10*np.log10((np.abs(Y_f[idx_f1])**2 + np.abs(Y_f[idx_f2])**2)/2 + 1e-20)
+        p_im3 = 10*np.log10((np.abs(Y_f[idx_im3_l])**2 + np.abs(Y_f[idx_im3_u])**2)/2 + 1e-20)
         
         pout_fund.append(p_fund)
         pout_im3.append(p_im3)
@@ -121,15 +128,21 @@ def analyze_im3_and_memory():
     amp = 10**(-2/20.0) # Near saturation
     
     for df in df_sweep:
-        f1, f2 = -df/2, df/2
-        x = amp * (np.exp(1j * 2 * np.pi * f1 * t) + np.exp(1j * 2 * np.pi * f2 * t))
+        f_center = 0.045
+        k1_s = int((f_center - df/2) * N_tt)
+        k2_s = int((f_center + df/2) * N_tt)
+        f1_s, f2_s = k1_s / N_tt, k2_s / N_tt
+        
+        x = amp * (np.exp(1j * 2 * np.pi * f1_s * t) + np.exp(1j * 2 * np.pi * f2_s * t))
         y = simulate_pa(x, SPS)
-        Y_f = np.fft.fft(y) / N_tt
+        
+        Y_f = np.fft.fft(y * window) / np.sum(window)
         freqs = np.fft.fftfreq(N_tt)
         
-        idx_im3_l, idx_im3_u = np.argmin(np.abs(freqs - (2*f1 - f2))), np.argmin(np.abs(freqs - (2*f2 - f1)))
-        im3_l_arr.append(10*np.log10(np.abs(Y_f[idx_im3_l])**2 + 1e-12))
-        im3_u_arr.append(10*np.log10(np.abs(Y_f[idx_im3_u])**2 + 1e-12))
+        idx_im3_l, idx_im3_u = np.argmin(np.abs(freqs - (2*f1_s - f2_s))), np.argmin(np.abs(freqs - (2*f2_s - f1_s)))
+        
+        im3_l_arr.append(10*np.log10(np.abs(Y_f[idx_im3_l])**2 + 1e-20))
+        im3_u_arr.append(10*np.log10(np.abs(Y_f[idx_im3_u])**2 + 1e-20))
 
     return pin_db, pout_fund, pout_im3, df_sweep, im3_l_arr, im3_u_arr
 
@@ -320,15 +333,11 @@ if st.sidebar.button("🚀 Run Simulation"):
         ax4.plot(pin_db, pout_fund, 'bo-', label='Fundamental')
         ax4.plot(pin_db, pout_im3, 'ro-', label='IM3 Product')
         
-        # Draw theoretical asymptotes using the linear region (first 5 points)
-        poly_fund = np.polyfit(pin_db[:5], pout_fund[:5], 1)
-        poly_im3 = np.polyfit(pin_db[:5], pout_im3[:5], 1)
+        # Draw theoretical asymptotes using the linear region (first 3 points)
+        y_int_fund = np.mean(np.array(pout_fund[:3]) - 1.0 * np.array(pin_db[:3]))
+        y_int_im3 = np.mean(np.array(pout_im3[:3]) - 3.0 * np.array(pin_db[:3]))
         
-        # Force slopes to theoretical 1 and 3 for IP3 visualization
-        y_int_fund = np.mean(pout_fund[:5] - 1.0 * pin_db[:5])
-        y_int_im3 = np.mean(pout_im3[:5] - 3.0 * pin_db[:5])
-        
-        extrapolate_x = np.linspace(-30, 15, 10)
+        extrapolate_x = np.linspace(np.min(pin_db)-5, np.max(pin_db)+10, 10)
         ax4.plot(extrapolate_x, 1.0 * extrapolate_x + y_int_fund, 'b--', alpha=0.5, label='Slope 1:1')
         ax4.plot(extrapolate_x, 3.0 * extrapolate_x + y_int_im3, 'r--', alpha=0.5, label='Slope 3:1 (IM3)')
         
