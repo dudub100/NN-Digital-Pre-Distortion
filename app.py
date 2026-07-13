@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Streamlit Web App: AI-Native DPD & PA Memory Analysis
+Streamlit Web App: AI-Native DPD & PA Memory Analysis with QC-LDPC
 """
 
 import streamlit as st
@@ -9,20 +9,21 @@ import tensorflow as tf
 from tensorflow.keras import layers, models
 from scipy.signal import upfirdn
 import matplotlib.pyplot as plt
+import math
 
 # ==========================================
 # STREAMLIT PAGE CONFIGURATION
 # ==========================================
 st.set_page_config(page_title="AI DPD Optimizer", layout="wide")
 st.title("📡 AI-Native DPD & Power Amplifier Memory Analysis")
-st.markdown("Optimize Digital Pre-Distortion using Time-Domain MSE or Frequency-Domain ETSI Mask constraints.")
+st.markdown("Optimize Digital Pre-Distortion and evaluate residual Bit Error Rate (BER) using a Rate 0.875 QC-LDPC code.")
 
 # ==========================================
 # SIDEBAR CONTROLS
 # ==========================================
 st.sidebar.header("Simulation Parameters")
-QAM_LEVEL = st.sidebar.selectbox("Modulation (QAM)", [16, 64, 256, 1024, 4096], index=1)
-TARGET_OBO_DB = st.sidebar.slider("Target Output Back-Off (dB)", min_value=0.0, max_value=10.0, value=4.0, step=0.5)
+QAM_LEVEL = st.sidebar.selectbox("Modulation (QAM)", [16, 64, 256, 1024, 4096], index=2)
+TARGET_OBO_DB = st.sidebar.slider("Target Output Back-Off (dB)", min_value=0.0, max_value=10.0, value=3.5, step=0.5)
 OPTIMIZATION_TARGET = st.sidebar.radio("Optimization Goal", ['MSE', 'MASK'])
 
 RRC_ALPHA = 0.12
@@ -37,20 +38,77 @@ active_batch_size = FFT_BATCH_SIZE if OPTIMIZATION_TARGET == 'MASK' else MSE_BAT
 active_epochs = 100 if OPTIMIZATION_TARGET == 'MASK' else 30
 
 # ==========================================
-# CORE DSP FUNCTIONS
+# CORE DSP & LDPC FUNCTIONS
 # ==========================================
+@st.cache_resource
+def get_qc_ldpc_r0875(z=30):
+    bg_p = np.array([[0, 5, 2, 10, 1, 7, 3]])
+    m_bg, k_bg = bg_p.shape
+    H = np.zeros((m_bg * z, (k_bg + m_bg) * z), dtype=int)
+    def get_circ(shift):
+        if shift < 0: return np.zeros((z, z), dtype=int)
+        return np.eye(z, dtype=int)[np.roll(np.arange(z), shift)]
+    for i in range(m_bg):
+        for j in range(k_bg):
+            H[i*z:(i+1)*z, j*z:(j+1)*z] = get_circ(bg_p[i, j])
+    for i in range(m_bg):
+        H[i*z:(i+1)*z, (k_bg+i)*z:(k_bg+i+1)*z] = np.eye(z)
+    P = H[:, :k_bg*z]
+    G = np.hstack((np.eye(k_bg*z, dtype=int), P.T))
+    return H, G, k_bg*z, (k_bg+m_bg)*z
+
+def ldpc_encode(data, G):
+    return np.dot(data, G) % 2
+
+def ldpc_decode(llrs, H, max_iter=20):
+    M, N = H.shape
+    V2C = np.zeros((M, N))
+    check_conns = [np.where(H[i, :] == 1)[0] for i in range(M)]
+    var_conns = [np.where(H[:, j] == 1)[0] for j in range(N)]
+    for i in range(M): V2C[i, check_conns[i]] = llrs[check_conns[i]]
+    for _ in range(max_iter):
+        C2V = np.zeros((M, N))
+        for i in range(M):
+            idxs = check_conns[i]
+            msgs = V2C[i, idxs]
+            for j_idx, j in enumerate(idxs):
+                others = np.delete(msgs, j_idx)
+                C2V[i, j] = np.prod(np.sign(others)) * np.min(np.abs(others))
+        L_total = llrs + np.sum(C2V, axis=0)
+        decoded = (L_total < 0).astype(int)
+        if np.all(np.dot(H, decoded) % 2 == 0): break
+        for j in range(N):
+            for i in var_conns[j]: V2C[i, j] = L_total[j] - C2V[i, j]
+    return decoded
+
+@st.cache_data
+def get_qam_const(m_order):
+    m = int(np.sqrt(m_order))
+    coords = np.arange(-m+1, m, 2)
+    gray = np.array([i ^ (i >> 1) for i in range(m)])
+    coords = coords[np.argsort(gray)]
+    grid = np.array([i + 1j*q for i in coords for q in coords])
+    return grid / np.sqrt(np.mean(np.abs(grid)**2))
+
+def calculate_llrs(rx, m_order, sigma2):
+    k = int(np.log2(m_order))
+    const = get_qam_const(m_order)
+    llrs = []
+    for s in rx:
+        dist = np.abs(s - const)**2
+        for b in range(k):
+            mask = (np.arange(m_order) >> (k - 1 - b)) & 1
+            llrs.append((np.min(dist[mask == 1]) - np.min(dist[mask == 0])) / sigma2)
+    return np.array(llrs)
+
 def get_etsi_weights(N, sps):
     freqs = np.fft.fftfreq(N)
     w = np.ones(N)
-    rs_norm = 1.0 / sps
-    CS_margin = 1.12 
-    f1, f2, f3, f4 = 0.440 * CS_margin, 0.536 * CS_margin, 0.604 * CS_margin, 1.392 * CS_margin
-    abs_f = np.abs(freqs) / rs_norm
-    
-    w[(abs_f > f1) & (abs_f <= f2)] = 5.0   
-    w[(abs_f > f2) & (abs_f <= f3)] = 20.0  
-    w[(abs_f > f3) & (abs_f <= f4)] = 100.0   
-    w[abs_f > f4] = 500.0  
+    abs_f = np.abs(freqs) * sps
+    w[(abs_f > 0.4928) & (abs_f <= 0.6003)] = 5.0   
+    w[(abs_f > 0.6003) & (abs_f <= 0.6765)] = 20.0  
+    w[(abs_f > 0.6765) & (abs_f <= 1.5590)] = 100.0   
+    w[abs_f > 1.5590] = 500.0  
     return w
 
 def apply_rapp(v, v_sat=1.0, p=2.0):
@@ -62,89 +120,24 @@ def apply_rapp(v, v_sat=1.0, p=2.0):
 
 def simulate_pa(x, SPS):
     eq_current = apply_rapp(x)
-    m1_lag1, m1_lag2 = -0.08 + 0.03j, 0.03 - 0.01j
     x_lag1, x_lag2 = np.roll(x, SPS), np.roll(x, 2*SPS)
     x_lag1[:SPS], x_lag2[:2*SPS] = 0, 0
     sat_lag1, sat_lag2 = apply_rapp(x_lag1), apply_rapp(x_lag2)
-    eq_memory = m1_lag1 * sat_lag1 * (np.abs(sat_lag1)**2) + m1_lag2 * sat_lag2 * (np.abs(sat_lag2)**2)
-    return eq_current + eq_memory
+    return eq_current + (-0.08 + 0.03j) * sat_lag1 * (np.abs(sat_lag1)**2) + (0.03 - 0.01j) * sat_lag2 * (np.abs(sat_lag2)**2)
 
 def create_volterra_dataset(data_in, data_out, mem_depth):
-    N = len(data_in)
     X_nn, Y_nn = [], []
-    for i in range(mem_depth, N):
-        window = data_in[i-mem_depth : i+1]
+    for i in range(mem_depth, len(data_in)):
+        win = data_in[i-mem_depth : i+1]
         features = []
-        for val in window:
-            features.extend([val.real, val.imag, np.abs(val)**2])
+        for val in win: features.extend([val.real, val.imag, np.abs(val)**2])
         current_val = data_in[i]
         for lag in range(1, mem_depth + 1):
             past_val = data_in[i - lag]
-            cross_3rd = current_val * (np.abs(past_val)**2)
-            cross_5th = current_val * (np.abs(past_val)**4)
+            cross_3rd, cross_5th = current_val * (np.abs(past_val)**2), current_val * (np.abs(past_val)**4)
             features.extend([cross_3rd.real, cross_3rd.imag, cross_5th.real, cross_5th.imag])
-        X_nn.append(features)
-        Y_nn.append([data_out[i].real, data_out[i].imag])
+        X_nn.append(features); Y_nn.append([data_out[i].real, data_out[i].imag])
     return np.array(X_nn), np.array(Y_nn)
-
-# ==========================================
-# TWO TONE ANALYSIS (IM3 & MEMORY ASYMMETRY)
-# ==========================================
-def analyze_im3_and_memory():
-    N_tt = 8192
-    t = np.arange(N_tt)
-    window = np.blackman(N_tt)
-    
-    # 1. Power Sweep (AM-AM & IM3 Asymptotes)
-    pin_db = np.linspace(-20, 5, 20)
-    pout_fund, pout_im3 = [], []
-    
-    # Snap frequencies exactly to FFT bins to completely eliminate spectral leakage
-    k1, k2 = int(0.04 * N_tt), int(0.05 * N_tt)
-    f1, f2 = k1 / N_tt, k2 / N_tt
-    
-    for p in pin_db:
-        amp = 10**(p/20.0)
-        x = amp * (np.exp(1j * 2 * np.pi * f1 * t) + np.exp(1j * 2 * np.pi * f2 * t))
-        y = simulate_pa(x, SPS)
-        
-        # Apply window to suppress start-of-burst transient leakage
-        Y_f = np.fft.fft(y * window) / np.sum(window)
-        freqs = np.fft.fftfreq(N_tt)
-        
-        idx_f1, idx_f2 = np.argmin(np.abs(freqs - f1)), np.argmin(np.abs(freqs - f2))
-        idx_im3_l, idx_im3_u = np.argmin(np.abs(freqs - (2*f1 - f2))), np.argmin(np.abs(freqs - (2*f2 - f1)))
-        
-        # Lower noise floor to -200 dB (1e-20) to reveal true 3:1 small-signal slope
-        p_fund = 10*np.log10((np.abs(Y_f[idx_f1])**2 + np.abs(Y_f[idx_f2])**2)/2 + 1e-20)
-        p_im3 = 10*np.log10((np.abs(Y_f[idx_im3_l])**2 + np.abs(Y_f[idx_im3_u])**2)/2 + 1e-20)
-        
-        pout_fund.append(p_fund)
-        pout_im3.append(p_im3)
-        
-    # 2. Frequency Sweep (Memory Asymmetry)
-    df_sweep = np.linspace(0.005, 0.1, 30)
-    im3_l_arr, im3_u_arr = [], []
-    amp = 10**(-2/20.0) # Near saturation
-    
-    for df in df_sweep:
-        f_center = 0.045
-        k1_s = int((f_center - df/2) * N_tt)
-        k2_s = int((f_center + df/2) * N_tt)
-        f1_s, f2_s = k1_s / N_tt, k2_s / N_tt
-        
-        x = amp * (np.exp(1j * 2 * np.pi * f1_s * t) + np.exp(1j * 2 * np.pi * f2_s * t))
-        y = simulate_pa(x, SPS)
-        
-        Y_f = np.fft.fft(y * window) / np.sum(window)
-        freqs = np.fft.fftfreq(N_tt)
-        
-        idx_im3_l, idx_im3_u = np.argmin(np.abs(freqs - (2*f1_s - f2_s))), np.argmin(np.abs(freqs - (2*f2_s - f1_s)))
-        
-        im3_l_arr.append(10*np.log10(np.abs(Y_f[idx_im3_l])**2 + 1e-20))
-        im3_u_arr.append(10*np.log10(np.abs(Y_f[idx_im3_u])**2 + 1e-20))
-
-    return pin_db, pout_fund, pout_im3, df_sweep, im3_l_arr, im3_u_arr
 
 # ==========================================
 # MAIN EXECUTION ROUTINE
@@ -154,15 +147,23 @@ if st.sidebar.button("🚀 Run Simulation"):
     tf.random.set_seed(42)
     tf.keras.backend.clear_session()
     
-    # UI Progress
     status_text = st.empty()
     progress_bar = st.progress(0)
     
-    # 1. GENERATE SIGNAL
-    status_text.text("1/5: Generating 64-QAM Baseband...")
-    m_pam = int(np.sqrt(QAM_LEVEL))
-    pam_levels = np.arange(-m_pam + 1, m_pam + 1, 2)
-    qam_syms = np.random.choice(pam_levels, NUM_SYMBOLS) + 1j * np.random.choice(pam_levels, NUM_SYMBOLS)
+    # 1. LDPC ENCODING & BASEBAND GENERATION
+    status_text.text("1/6: Encoding LDPC Blocks & Generating Baseband...")
+    H_ldpc, G_ldpc, K_ldpc, N_ldpc = get_qc_ldpc_r0875(z=30)
+    k_qam = int(np.log2(QAM_LEVEL))
+    syms_per_block = N_ldpc / k_qam
+    total_blocks = math.ceil(NUM_SYMBOLS / syms_per_block)
+    
+    tx_data_bits = np.random.randint(0, 2, total_blocks * K_ldpc)
+    tx_coded_bits = np.zeros(total_blocks * N_ldpc, dtype=int)
+    for b in range(total_blocks):
+        tx_coded_bits[b*N_ldpc : (b+1)*N_ldpc] = ldpc_encode(tx_data_bits[b*K_ldpc : (b+1)*K_ldpc], G_ldpc)
+        
+    indices = tx_coded_bits.reshape(-1, k_qam).dot(1 << np.arange(k_qam)[::-1])
+    qam_syms = get_qam_const(QAM_LEVEL)[indices][:NUM_SYMBOLS]
     
     t_rrc = np.arange(-FILTER_SPAN*SPS//2, FILTER_SPAN*SPS//2 + 1) / SPS
     h_rrc = np.zeros(len(t_rrc))
@@ -174,10 +175,10 @@ if st.sidebar.button("🚀 Run Simulation"):
     
     raw_x = upfirdn(h_rrc, qam_syms, up=SPS)
     x_normalized = raw_x / np.max(np.abs(raw_x))
-    progress_bar.progress(20)
+    progress_bar.progress(15)
     
     # 2. PA MODEL & OBO
-    status_text.text("2/5: Simulating Hardware PA and targeting OBO...")
+    status_text.text("2/6: Simulating Hardware PA and targeting OBO...")
     sweep_in = np.linspace(0.01, 2.0, 500)
     actual_out = np.abs(simulate_pa(sweep_in + 0j, SPS=1))
     p_out_p1db_dB = 10 * np.log10(actual_out[np.argmax((10*np.log10(sweep_in**2) - 10*np.log10(actual_out**2)) >= 1.0)]**2)
@@ -192,10 +193,10 @@ if st.sidebar.button("🚀 Run Simulation"):
         
     x_ideal = x_normalized * best_scale
     y_distorted = simulate_pa(x_ideal, SPS)
-    progress_bar.progress(40)
+    progress_bar.progress(30)
     
     # 3. POLYNOMIAL DPD
-    status_text.text("3/5: Extracting Memoryless Polynomial...")
+    status_text.text("3/6: Extracting Memoryless Polynomial...")
     X_poly = np.column_stack([y_distorted, y_distorted * (np.abs(y_distorted)**2), y_distorted * (np.abs(y_distorted)**4), y_distorted * (np.abs(y_distorted)**6)])
     if OPTIMIZATION_TARGET == 'MSE':
         poly_coeffs, _, _, _ = np.linalg.lstsq(X_poly, x_ideal, rcond=None)
@@ -205,10 +206,10 @@ if st.sidebar.button("🚀 Run Simulation"):
         W_sqrt = np.sqrt(get_etsi_weights(len(x_ideal), SPS))
         poly_coeffs, _, _, _ = np.linalg.lstsq(X_poly_f * W_sqrt[:, None], x_ideal_f * W_sqrt, rcond=None)
     x_pred_poly = np.dot(X_poly, poly_coeffs)
-    progress_bar.progress(60)
+    progress_bar.progress(45)
     
     # 4. NEURAL NETWORK DPD
-    status_text.text(f"4/5: Training Volterra TDNN ({active_epochs} epochs)...")
+    status_text.text(f"4/6: Training Volterra TDNN ({active_epochs} epochs)...")
     X_nn_full, Y_nn_full = create_volterra_dataset(y_distorted, x_ideal, MEMORY_DEPTH)
     trim_len = (len(X_nn_full) // active_batch_size) * active_batch_size
     X_train_full, Y_train_full = X_nn_full[:trim_len], Y_nn_full[:trim_len]
@@ -218,17 +219,14 @@ if st.sidebar.button("🚀 Run Simulation"):
     
     nn_model = models.Sequential([
         layers.Input(shape=(X_train.shape[1],)),
-        layers.Dense(256, activation='tanh'),
-        layers.Dense(128, activation='tanh'),
-        layers.Dense(64, activation='tanh'),
-        layers.Dense(2, activation='linear')
+        layers.Dense(256, activation='tanh'), layers.Dense(128, activation='tanh'),
+        layers.Dense(64, activation='tanh'), layers.Dense(2, activation='linear')
     ])
     
     if OPTIMIZATION_TARGET == 'MASK':
         w_batch_tf = tf.constant(get_etsi_weights(active_batch_size, SPS), dtype=tf.float32)
         def mask_loss_fn(y_true, y_pred):
-            err_c = tf.complex(y_true[:, 0] - y_pred[:, 0], y_true[:, 1] - y_pred[:, 1])
-            return tf.reduce_mean(tf.math.square(tf.math.abs(tf.signal.fft(err_c))) * w_batch_tf)
+            return tf.reduce_mean(tf.math.square(tf.math.abs(tf.signal.fft(tf.complex(y_true[:, 0] - y_pred[:, 0], y_true[:, 1] - y_pred[:, 1])))) * w_batch_tf)
         nn_model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.0005), loss=mask_loss_fn)
     else:
         nn_model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.0005), loss='mse')
@@ -238,30 +236,58 @@ if st.sidebar.button("🚀 Run Simulation"):
     nn_pred_raw = nn_model.predict(X_nn_full, batch_size=active_batch_size, verbose=0)
     x_pred_nn = np.zeros_like(x_ideal, dtype=complex)
     x_pred_nn[MEMORY_DEPTH : MEMORY_DEPTH + len(nn_pred_raw)] = nn_pred_raw[:, 0] + 1j * nn_pred_raw[:, 1]
-    progress_bar.progress(80)
+    progress_bar.progress(60)
     
-    # 5. RECEIVER EVALUATION & IM3 ANALYSIS
-    status_text.text("5/5: Receiver Evaluation and Two-Tone Tests...")
-    
-    # Calculate EVM
+    # 5. RECEIVER EVM EVALUATION
+    status_text.text("5/6: Receiver EVM Evaluation...")
     rx_ideal = upfirdn(h_rrc, x_ideal, up=1, down=1)
     rx_distorted = upfirdn(h_rrc, y_distorted, up=1, down=1)
     rx_poly = upfirdn(h_rrc, x_pred_poly, up=1, down=1)
     rx_nn = upfirdn(h_rrc, x_pred_nn, up=1, down=1)
     
     delay = 2 * np.argmax(h_rrc)
-    sym_ideal = rx_ideal[delay : delay + NUM_SYMBOLS*SPS : SPS][MEMORY_DEPTH:]
-    sym_distorted = rx_distorted[delay : delay + NUM_SYMBOLS*SPS : SPS][MEMORY_DEPTH:]
-    sym_poly = rx_poly[delay : delay + NUM_SYMBOLS*SPS : SPS][MEMORY_DEPTH:]
-    sym_nn = rx_nn[delay : delay + NUM_SYMBOLS*SPS : SPS][MEMORY_DEPTH:]
+    sym_ideal = rx_ideal[delay : delay + NUM_SYMBOLS*SPS : SPS]
+    sym_distorted = rx_distorted[delay : delay + NUM_SYMBOLS*SPS : SPS]
+    sym_poly = rx_poly[delay : delay + NUM_SYMBOLS*SPS : SPS]
+    sym_nn = rx_nn[delay : delay + NUM_SYMBOLS*SPS : SPS]
     
     def evm(ideal, test):
         scaled = test * (np.mean(np.abs(ideal)) / np.mean(np.abs(test)))
         return 10 * np.log10(np.mean(np.abs(ideal - scaled)**2) / np.mean(np.abs(ideal)**2))
     
-    evm_raw, evm_poly, evm_nn = evm(sym_ideal, sym_distorted), evm(sym_ideal, sym_poly), evm(sym_ideal, sym_nn)
+    evm_raw = evm(sym_ideal[MEMORY_DEPTH:], sym_distorted[MEMORY_DEPTH:])
+    evm_poly = evm(sym_ideal[MEMORY_DEPTH:], sym_poly[MEMORY_DEPTH:])
+    evm_nn = evm(sym_ideal[MEMORY_DEPTH:], sym_nn[MEMORY_DEPTH:])
+    progress_bar.progress(75)
+
+    # 6. LDPC DECODING & BER CALCULATION
+    status_text.text("6/6: Calculating LLRs and running LDPC Min-Sum Decoder (This may take a moment)...")
     
-    # Generate Spectra (ILA)
+    start_block = math.ceil(MEMORY_DEPTH / syms_per_block)
+    end_block = int(len(sym_nn) // syms_per_block)
+    blocks_to_test = end_block - start_block
+    
+    start_sym, end_sym = int(start_block * syms_per_block), int(end_block * syms_per_block)
+    test_data_bits = tx_data_bits[start_block*K_ldpc : end_block*K_ldpc]
+
+    def process_ber(ideal, test):
+        const_rms = np.sqrt(np.mean(np.abs(get_qam_const(QAM_LEVEL))**2))
+        t_scaled = test * (const_rms / np.sqrt(np.mean(np.abs(test)**2)))
+        i_scaled = ideal * (const_rms / np.sqrt(np.mean(np.abs(ideal)**2)))
+        sigma2 = np.mean(np.abs(i_scaled - t_scaled)**2)
+        llrs = calculate_llrs(t_scaled, QAM_LEVEL, sigma2)
+        
+        errors = 0
+        for b in range(blocks_to_test):
+            decoded = ldpc_decode(llrs[b*N_ldpc : (b+1)*N_ldpc], H_ldpc)
+            errors += np.sum(decoded[:K_ldpc] != test_data_bits[b*K_ldpc : (b+1)*K_ldpc])
+        return errors / (blocks_to_test * K_ldpc)
+
+    ber_raw = process_ber(sym_ideal[start_sym:end_sym], sym_distorted[start_sym:end_sym])
+    ber_poly = process_ber(sym_ideal[start_sym:end_sym], sym_poly[start_sym:end_sym])
+    ber_nn = process_ber(sym_ideal[start_sym:end_sym], sym_nn[start_sym:end_sym])
+    
+    # Run ILA for plotting
     X_ideal_poly = np.column_stack([x_ideal, x_ideal * (np.abs(x_ideal)**2), x_ideal * (np.abs(x_ideal)**4), x_ideal * (np.abs(x_ideal)**6)])
     pa_lin_poly = simulate_pa(np.dot(X_ideal_poly, poly_coeffs), SPS)
     
@@ -270,23 +296,32 @@ if st.sidebar.button("🚀 Run Simulation"):
     x_dpd_nn_ila = np.zeros_like(x_ideal, dtype=complex)
     x_dpd_nn_ila[MEMORY_DEPTH : MEMORY_DEPTH + len(nn_dpd_raw_ila)] = nn_dpd_raw_ila[:, 0] + 1j * nn_dpd_raw_ila[:, 1]
     pa_lin_nn = simulate_pa(x_dpd_nn_ila, SPS)
-    
-    # Run Two Tone IM3 Tests
-    pin_db, pout_fund, pout_im3, df_sweep, im3_l_arr, im3_u_arr = analyze_im3_and_memory()
-    
+
     progress_bar.progress(100)
-    status_text.text("Simulation Complete!")
+    status_text.text(f"Simulation Complete! Tested {blocks_to_test} LDPC blocks.")
 
     # ==========================================
     # UI METRICS AND GRAPHS
     # ==========================================
     st.markdown("---")
     col1, col2, col3 = st.columns(3)
-    col1.metric("Raw PA EVM (No DPD)", f"{evm_raw:.2f} dB")
-    col2.metric("Polynomial DPD EVM", f"{evm_poly:.2f} dB", f"{evm_poly - evm_raw:.2f} dB", delta_color="inverse")
-    col3.metric("Volterra NN DPD EVM", f"{evm_nn:.2f} dB", f"{evm_nn - evm_raw:.2f} dB", delta_color="inverse")
+    
+    with col1:
+        st.subheader("🔴 Raw PA (No DPD)")
+        st.metric("EVM", f"{evm_raw:.2f} dB")
+        st.metric("BER", f"{ber_raw:.2e}")
+        
+    with col2:
+        st.subheader("🔵 Polynomial DPD")
+        st.metric("EVM", f"{evm_poly:.2f} dB", f"{evm_poly - evm_raw:.2f} dB", delta_color="inverse")
+        st.metric("BER", f"{ber_poly:.2e}")
+        
+    with col3:
+        st.subheader("🟢 Volterra NN DPD")
+        st.metric("EVM", f"{evm_nn:.2f} dB", f"{evm_nn - evm_raw:.2f} dB", delta_color="inverse")
+        st.metric("BER", f"{ber_nn:.2e}")
 
-    tab1, tab2, tab3 = st.tabs(["Spectrum & Constellations", "AM-AM & IM3 Asymptotes", "Memory Asymmetry (IM3 Freq Sweep)"])
+    tab1, tab2 = st.tabs(["Spectrum & Constellations", "AM-AM Characteristic"])
 
     with tab1:
         fig1, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
@@ -309,8 +344,8 @@ if st.sidebar.button("🚀 Run Simulation"):
         
         # Constellation Plot
         subset = 1500
-        ax2.scatter(sym_distorted[:subset].real, sym_distorted[:subset].imag, color='r', s=2, alpha=0.4, label='Raw')
-        ax2.scatter(sym_nn[:subset].real, sym_nn[:subset].imag, color='g', s=2, alpha=0.8, label='NN Corrected')
+        ax2.scatter(sym_distorted[MEMORY_DEPTH:subset].real, sym_distorted[MEMORY_DEPTH:subset].imag, color='r', s=2, alpha=0.4, label='Raw')
+        ax2.scatter(sym_nn[MEMORY_DEPTH:subset].real, sym_nn[MEMORY_DEPTH:subset].imag, color='g', s=2, alpha=0.8, label='NN Corrected')
         ax2.set_title(f'Recovered Constellation ({QAM_LEVEL}-QAM)')
         ax2.legend()
         ax2.set_aspect('equal')
@@ -318,50 +353,13 @@ if st.sidebar.button("🚀 Run Simulation"):
         st.pyplot(fig1)
 
     with tab2:
-        fig2, (ax3, ax4) = plt.subplots(1, 2, figsize=(16, 6))
-        
-        # AM-AM Linearization Plot
+        fig2, ax3 = plt.subplots(figsize=(8, 6))
         ax3.scatter(np.abs(x_ideal[::10]), np.abs(y_distorted[::10]), s=1, alpha=0.3, label='Raw PA', color='red')
+        ax3.scatter(np.abs(x_ideal[::10]), np.abs(pa_lin_poly[::10]), s=1, alpha=0.3, label='Poly Linearized', color='blue')
         ax3.scatter(np.abs(x_ideal[::10]), np.abs(pa_lin_nn[::10]), s=1, alpha=0.3, label='NN Linearized', color='green')
-        ax3.set_title('AM-AM Hardware Linearization')
+        ax3.set_title(f'AM-AM Hardware Linearization ({OPTIMIZATION_TARGET} Target)')
         ax3.set_xlabel('Input Amplitude |x|')
         ax3.set_ylabel('Output Amplitude |y|')
         ax3.legend()
         ax3.grid(True)
-        
-        # Pout vs Pin (IM3 Asymptote)
-        ax4.plot(pin_db, pout_fund, 'bo-', label='Fundamental')
-        ax4.plot(pin_db, pout_im3, 'ro-', label='IM3 Product')
-        
-        # Draw theoretical asymptotes using the linear region (first 3 points)
-        y_int_fund = np.mean(np.array(pout_fund[:3]) - 1.0 * np.array(pin_db[:3]))
-        y_int_im3 = np.mean(np.array(pout_im3[:3]) - 3.0 * np.array(pin_db[:3]))
-        
-        extrapolate_x = np.linspace(np.min(pin_db)-5, np.max(pin_db)+10, 10)
-        ax4.plot(extrapolate_x, 1.0 * extrapolate_x + y_int_fund, 'b--', alpha=0.5, label='Slope 1:1')
-        ax4.plot(extrapolate_x, 3.0 * extrapolate_x + y_int_im3, 'r--', alpha=0.5, label='Slope 3:1 (IM3)')
-        
-        ax4.set_title('Pout vs Pin (IP3 Extrapolation)')
-        ax4.set_xlabel('Input Power (dB)')
-        ax4.set_ylabel('Output Power (dB)')
-        ax4.set_ylim(np.min(pout_im3)-5, np.max(pout_fund)+15)
-        ax4.legend()
-        ax4.grid(True)
-        
         st.pyplot(fig2)
-        
-    with tab3:
-        fig3, ax5 = plt.subplots(figsize=(10, 6))
-        
-        # Memory Asymmetry Plot (Upper vs Lower IM3)
-        ax5.plot(df_sweep, im3_l_arr, 'r-', linewidth=2, label='Lower IM3 (-3Δf)')
-        ax5.plot(df_sweep, im3_u_arr, 'b-', linewidth=2, label='Upper IM3 (+3Δf)')
-        ax5.fill_between(df_sweep, im3_l_arr, im3_u_arr, color='gray', alpha=0.2, label='Memory-Induced Asymmetry')
-        
-        ax5.set_title('IM3 Asymmetry vs. Tone Spacing (Proof of PA Memory)')
-        ax5.set_xlabel('Tone Spacing Δf (Normalized)')
-        ax5.set_ylabel('IM3 Power (dB)')
-        ax5.legend()
-        ax5.grid(True)
-        
-        st.pyplot(fig3)
